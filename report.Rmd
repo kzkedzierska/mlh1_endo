@@ -1,0 +1,261 @@
+---
+title: "MLH1 in Endometrial cancer"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Setup
+
+We are working on hg38 and the following defaults were set:
+
+```{r setup}
+library(tidyverse)
+library(ggsci)
+library(gridExtra)
+theme_set(theme_classic())
+
+# testing fo packages called later, but not attached
+packages_not_attached <- c("data.table", "ggforce")
+if (any(!packages_not_attached %in% installed.packages())) {
+  print(paste0("Following packages are not installed, ",
+               "and this report will not work properly: ", 
+               paste(packages_not_attached[!packages_not_attached %in% installed.packages()], 
+                     collapse = ", "),
+               "."))
+}
+
+methylation_probes <- data.table::fread("./data/methylation_chr3_GRCh38.bed") %>%
+  select(probe_id = V4, position = V2)
+
+# Defaults
+gene_start <- 36993332
+snp_position <- 36993455
+```
+
+# Downloading and pre-processing the data
+
+The preprocessing.R script requires:
+
+* MSI status of the samples: tab-delim file with two columns - Case ID and MSS_status, one TCGA identifier per row. 
+  
+```{r}
+data.table::fread("./data/msi_status.txt") %>%
+  head()
+```
+
+* manifests - one for expression and methylation, and one for raw WES sequenicng;
+* paths to directories with:
+  * platypus calls;
+  * expression data;
+  * methylation data.
+
+The command that generated full_df:
+
+```{r, engine = 'bash', eval = FALSE}
+Rscript --vanilla ./scripts/preprocessing.R \
+  --manifest ./inputs/manifest_expression_methylation.txt \
+  --genotype_manifest ./inputs/manifest_genotype.txt \
+  --status ./data/msi_status.txt \
+  --platypus /gpfs2/well/lewis/projects/annie/TCGA/platypuscallendo \
+  --expression ./data/expression/ \
+  --methylation ./data/methylation/
+```
+
+Full_df is a starting point of the all subsequent analyses. Let's get ourselves aquianted with this dataframe then.
+
+```{r}
+full_df <- data.table::fread("full_df.tsv") %>%
+  mutate(sample_type = gsub("Control", "Normal", sample_type)) %>%
+  rename(Genotype = Germline)
+
+head(full_df)
+```
+
+```{r}
+full_df %>%
+  group_by(sample_id, sample_type) %>%
+  mutate(has_methylation = any(!is.na(beta))) %>%
+  ungroup() %>%
+  select(sample_id, sample_type, has_methylation, expression) %>%
+  distinct() %>%
+  filter(!is.na(sample_type)) %>%
+  group_by(sample_type) %>%
+  summarise(number_of_samples = n(),
+            number_of_samples_with_methylation = sum(has_methylation),
+            number_of_samples_with_expression = sum(!is.na(expression)))
+```
+
+# Analysis and visualisation
+
+## Tumor and Normal
+
+```{r}
+expression <- full_df %>% 
+  filter(!is.na(sample_type), !is.na(Genotype)) %>% 
+  select(sample_id, expression, sample_type, Genotype) %>% 
+  unique() %>% 
+  ggplot(., aes(Genotype, expression, color = Genotype)) + 
+  ggforce::geom_sina(color = "grey") + 
+  geom_boxplot(alpha=.4, width = .2) +
+  facet_wrap(~sample_type) +
+  scale_color_aaas()
+
+methylation <- full_df %>% 
+  filter(!is.na(sample_type), !is.na(Genotype)) %>%
+         #probe_id %in% c("cg00893636", "cg02279071", "cg13846866")) %>% 
+  group_by(sample_id, Genotype, Somatic, sample_type) %>%
+  summarise(beta = median(beta, na.rm = T)) %>%
+  ggplot(., aes(Genotype, beta, color = Genotype)) + 
+  ggforce::geom_sina(color = "grey") + 
+  geom_boxplot(alpha=.4, width = .2) +
+  facet_wrap(~sample_type) +
+  scale_color_aaas()
+
+grid.arrange(expression, methylation, nrow = 2)
+```
+### Methylation around start
+
+```{r}
+
+methylation_around_start <- full_df %>%
+  left_join(methylation_probes) %>%
+  filter(!is.na(Genotype),
+         !is.na(position))%>%
+  arrange(position) %>%
+  filter(position > gene_start - 2000, 
+         position < gene_start + 2000) %>%
+  ggplot(., aes(x = position, y = beta, 
+                color = Genotype, group = Genotype)) +
+  geom_smooth() +
+  facet_wrap(~sample_type) +
+  theme_classic() + 
+  geom_vline(xintercept = snp_position) +
+  geom_vline(xintercept = gene_start, linetype = "dotdash") +
+  geom_smooth(method = "auto") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) + 
+  scale_color_aaas() 
+
+methylation_around_start
+
+```
+
+### Uneven distribution of samples
+
+```{r}
+full_df %>% 
+    select(sample_id, sample_type, Genotype) %>% 
+    unique() %>% 
+    group_by(sample_type, Genotype) %>% 
+    summarise(count = n()) %>% 
+    filter(!is.na(Genotype)) %>% 
+    ggplot(., aes(x = Genotype, y = count, fill = Genotype)) + 
+    geom_bar(stat = "identity") + 
+    facet_wrap(~sample_type) + 
+    scale_fill_aaas() + 
+    geom_text(aes(label = count), 
+              position = position_dodge(width=0.9),
+              vjust=-0.25) +
+    labs(y = "Number of samples")
+```
+My intuition is that "A" allele should be more represented in the Tumor cohort. However, it would make sense under the assumption that Normal cohort is representative etc. Nevertheless, Fisher test for "at least one A allele" and "no A allele" fives p-value just below 0.05.  
+```{r}
+n_samps_df <- full_df %>% 
+  select(sample_id, sample_type, Genotype) %>% 
+  unique() %>% 
+  group_by(sample_type, Genotype) %>% 
+  summarise(count = n()) %>% 
+  filter(!is.na(Genotype)) 
+
+n_samps_df_wide <- n_samps_df %>%
+  spread(Genotype, count) %>%
+  column_to_rownames("sample_type")
+
+n_samps_df_wide$with_alt <- n_samps_df_wide$AA + n_samps_df_wide$GA
+
+n_samps_df_wide %>% 
+  select(GG, with_alt) %>%
+  fisher.test()
+```
+
+The AA, GA, and GG comparison gives higher p-value. 
+
+```{r}
+n_samps_df_wide %>% 
+  select(GG, GA, AA) %>%
+  fisher.test()
+```
+
+## Tumor and microsatelite stability
+
+### Methylation and expression
+
+```{r}
+meth <- full_df %>% 
+  mutate(MSS_status = ifelse(MSS_status %in% c("mss", NA), 
+                             toupper(MSS_status),
+                             "MSI")) %>%
+  filter(probe_id %in% c("cg00893636", "cg02279071", "cg13846866"),
+         !is.na(Genotype), !is.na(MSS_status),
+         sample_type == "Tumor") %>%
+  group_by(sample_id, expression, Genotype, Somatic, MSS_status) %>%
+  summarise(beta = median(beta, na.rm = T)) %>%
+  ggplot(., aes(Genotype, beta, color = Genotype, group = Genotype)) +
+  ggforce::geom_sina(color = "grey") + 
+  geom_boxplot(alpha=.4, width = .2) +
+  facet_wrap(~MSS_status) + #, scale = "free"
+  theme_classic() +
+  scale_color_aaas() +
+  labs(x = "Genotype",
+        y = "Beta", #[median for cg00893636, cg02279071, cg13846866 probes]
+        title = "Methylation in proximity of the MLH1 promoter") +
+  theme(legend.position = "none")
+
+expr <- full_df %>% 
+  mutate(MSS_status = ifelse(MSS_status %in% c("mss", NA), 
+                             toupper(MSS_status),
+                             "MSI")) %>%
+  select(-probe_id, -beta) %>%
+  unique() %>%
+  filter(!is.na(Genotype), !is.na(MSS_status), sample_type == "Tumor") %>%
+  ggplot(., aes(Genotype, expression, color = Genotype, group = Genotype)) +
+  #geom_jitter() + 
+  ggforce::geom_sina(color = "grey") + 
+  geom_boxplot(alpha=.4, width = .2) +
+  facet_wrap(~MSS_status) +
+  theme_classic() +
+  scale_color_aaas() +
+  labs(x = "Genotype",
+       y = "FPKM-UQ",
+       title = "Expression of the MLH1 gene") +
+  theme(legend.position = "none")
+
+grid.arrange(meth, expr, nrow = 2)
+```
+
+### Methylation around start 
+
+```{r}
+methylation_around_start <- full_df %>%
+  filter(sample_type == "Tumor") %>%
+  left_join(methylation_probes) %>%
+  filter(!is.na(Genotype),
+         !is.na(position))%>%
+  mutate(MSS_status = ifelse(MSS_status %in% c("mss", NA),
+                             toupper(MSS_status),
+                             "MSI")) %>%
+  arrange(position) %>%
+  filter(position > 36993332 - 2000, position < 36993332 + 2000) %>%
+  ggplot(., aes(x = position, y = beta, color = Genotype, group = Genotype)) +
+  #geom_boxplot() +
+  geom_smooth() +
+  facet_wrap(~MSS_status) +
+  theme_classic() + 
+  geom_vline(xintercept = 36993455) +
+  geom_vline(xintercept = 36993332, linetype = "dotdash") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) + 
+  scale_color_aaas() 
+
+methylation_around_start
+```
+
